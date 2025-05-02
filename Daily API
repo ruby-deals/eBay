@@ -1,7 +1,5 @@
 // ===== CONFIGURATION =====
 // Use your provided eBay developer credentials.
-const CLIENT_ID = "RubyColl-DailyLis-PRD-52572671c-aca5c484";
-const CLIENT_SECRET = "PRD-2572671c3ce7-710a-48c0-a4f9-8f8c";
 
 // ===== TOKEN MANAGEMENT =====
 
