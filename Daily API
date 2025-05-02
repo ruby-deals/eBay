@@ -1,0 +1,333 @@
+// ===== CONFIGURATION =====
+// Use your provided eBay developer credentials.
+const CLIENT_ID = "RubyColl-DailyLis-PRD-52572671c-aca5c484";
+const CLIENT_SECRET = "PRD-2572671c3ce7-710a-48c0-a4f9-8f8c";
+
+// ===== TOKEN MANAGEMENT =====
+
+/**
+ * Loads the token from an uploaded token.json file on Drive and stores it in Script Properties.
+ * This function should be run initially to ingest token data from your PowerShell-generated file.
+ */
+function loadTokenFromDrive() {
+  var files = DriveApp.getFilesByName("token.json");
+  if (!files.hasNext()) {
+    Logger.log("No token.json file found in Drive. Please upload it first.");
+    return;
+  }
+  var tokenFile = files.next();
+  var content = tokenFile.getBlob().getDataAsString();
+  var tokenData = JSON.parse(content);
+  
+  if (!tokenData.access_token) {
+    Logger.log("token.json does not contain a valid access_token.");
+    return;
+  }
+  
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty('accessToken', tokenData.access_token);
+  if (tokenData.refresh_token) {
+    props.setProperty('refreshToken', tokenData.refresh_token);
+  }
+  if (tokenData.expires_in) {
+    // Store expiration time as epoch milliseconds.
+    var expiresAt = new Date().getTime() + (parseInt(tokenData.expires_in, 10) * 1000);
+    props.setProperty('expiresAt', expiresAt.toString());
+  }
+  
+  Logger.log("Token loaded from token.json and stored in Script Properties.");
+}
+
+/**
+ * Checks if the current token has expired.
+ * If expired, refreshes the token using the refresh token.
+ * Returns a valid access token.
+ */
+function refreshAccessToken() {
+  var props = PropertiesService.getScriptProperties();
+  var refreshToken = props.getProperty('refreshToken');
+  var expiresAtStr = props.getProperty('expiresAt');
+  var currentTime = new Date().getTime();
+  
+  // If expiration time is set and the token is still valid, return it.
+  if (expiresAtStr && currentTime < parseInt(expiresAtStr, 10)) {
+    return props.getProperty('accessToken');
+  }
+  
+  // If token expired, ensure we have a refresh token.
+  if (!refreshToken) {
+    Logger.log("No refresh token available. Please reauthenticate manually.");
+    return null;
+  }
+  
+  var url = "https://api.ebay.com/identity/v1/oauth2/token";
+  var payload = "grant_type=refresh_token&refresh_token=" + encodeURIComponent(refreshToken);
+  var authString = CLIENT_ID + ":" + CLIENT_SECRET;
+  var headers = {
+    "Authorization": "Basic " + Utilities.base64Encode(authString),
+    "Content-Type": "application/x-www-form-urlencoded"
+  };
+  var options = {
+    "method": "post",
+    "payload": payload,
+    "headers": headers,
+    "muteHttpExceptions": true
+  };
+  
+  var response = UrlFetchApp.fetch(url, options);
+  if (response.getResponseCode() != 200) {
+    Logger.log("Error refreshing token: " + response.getContentText());
+    return null;
+  }
+  
+  var json = JSON.parse(response.getContentText());
+  if (json.access_token) {
+    var newAccessToken = json.access_token;
+    var newRefreshToken = json.refresh_token || refreshToken;
+    var newExpiresAt = new Date().getTime() + (json.expires_in * 1000);
+    
+    props.setProperty('accessToken', newAccessToken);
+    props.setProperty('refreshToken', newRefreshToken);
+    props.setProperty('expiresAt', newExpiresAt.toString());
+    
+    Logger.log("Token refreshed successfully.");
+    return newAccessToken;
+  }
+  
+  return null;
+}
+
+// ===== EBAY API CALLS =====
+
+/**
+ * Calls the eBay Trading API (GetItem) via SOAP to retrieve the Start Time for an item.
+ *
+ * @param {string} itemNumber - The eBay item (or legacy item) number.
+ * @param {string} token - A valid OAuth token.
+ * @return {string|null} The Start Time text from eBay (if found) or null.
+ */
+function getItemStartTime(itemNumber, token) {
+  var xml =
+    '<?xml version="1.0" encoding="utf-8"?>' +
+    '<GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">' +
+      '<ItemID>' + itemNumber + '</ItemID>' +
+      '<DetailLevel>ReturnAll</DetailLevel>' +
+      '<RequesterCredentials>' +
+        '<eBayAuthToken>' + token + '</eBayAuthToken>' +
+      '</RequesterCredentials>' +
+    '</GetItemRequest>';
+  
+  var url = "https://api.ebay.com/ws/api.dll";
+  var headers = {
+    'X-EBAY-API-CALL-NAME': 'GetItem',
+    'X-EBAY-API-SITEID': '0',
+    'X-EBAY-API-COMPATIBILITY-LEVEL': '967',
+    'Content-Type': 'text/xml',
+    'X-EBAY-API-IAF-TOKEN': token
+  };
+  var options = {
+    'method': 'post',
+    'payload': xml,
+    'headers': headers,
+    'muteHttpExceptions': true
+  };
+  
+  try {
+    var response = UrlFetchApp.fetch(url, options);
+    if (response.getResponseCode() !== 200) {
+      Logger.log("GetItem error for item " + itemNumber + ": Response code " + response.getResponseCode());
+      return null;
+    }
+    var responseXml = response.getContentText();
+    var document = XmlService.parse(responseXml);
+    var ns = XmlService.getNamespace("urn:ebay:apis:eBLBaseComponents");
+    var root = document.getRootElement();
+    var itemElement = root.getChild("Item", ns);
+    if (!itemElement) return null;
+    var listingDetails = itemElement.getChild("ListingDetails", ns);
+    if (!listingDetails) return null;
+    var startTimeElement = listingDetails.getChild("StartTime", ns);
+    if (startTimeElement) {
+      return startTimeElement.getText();
+    }
+    return null;
+  } catch(e) {
+    Logger.log("Error fetching start time for item " + itemNumber + ": " + e);
+    return null;
+  }
+}
+
+// ===== MAIN FUNCTION =====
+
+/**
+ * Main function:
+ * - Loads the token from token.json.
+ * - Retrieves orders via the eBay Fulfillment API.
+ * - For each order line item (with "NOT_STARTED" status), calls the Trading API 
+ *   to get the Start Time.
+ * - Creates a Google Doc in the "Ruby Collectibles" folder.
+ *   Each item's line is output as a single paragraph:
+ *     - For items NOT under the "Quantity" SKU tag: the hyperlinked title is followed by
+ *       a fixed spacer (10 non‑breaking spaces) and then the date (formatted as MM/dd/yy).
+ *       If the item's date is 2 days old or less, the entire line is set in bold.
+ *     - For items under the "Quantity" SKU tag: only the hyperlinked title is shown (no date).
+ *   When the SKU group changes (based on skuTag), an extra blank paragraph is inserted as a line break.
+ */
+function importAPIandFormatToDoc() {
+  // Step 1: Load token from token.json into Script Properties.
+  // (Run loadTokenFromDrive() manually initially if not already stored.)
+  loadTokenFromDrive();
+  
+  // Step 2: Retrieve a valid access token (refreshing it if necessary).
+  var accessToken = refreshAccessToken();
+  if (!accessToken) {
+    Logger.log("Could not obtain a valid access token.");
+    return;
+  }
+  
+  // Step 3: Locate the "Ruby Collectibles" folder.
+  var folderName = "Ruby Collectibles";
+  var folderIterator = DriveApp.getFoldersByName(folderName);
+  if (!folderIterator.hasNext()) {
+    Logger.log("Error: Folder '" + folderName + "' not found.");
+    return;
+  }
+  var folder = folderIterator.next();
+  
+  // Step 4: Retrieve orders via the eBay Fulfillment API.
+  var apiUrl = "https://api.ebay.com/sell/fulfillment/v1/order";
+  var response = UrlFetchApp.fetch(apiUrl, {
+    "method": "get",
+    "headers": {
+      "Authorization": "Bearer " + accessToken,
+      "Content-Type": "application/json"
+    },
+    "muteHttpExceptions": true
+  });
+  if (response.getResponseCode() !== 200) {
+    Logger.log("Error fetching orders: " + response.getContentText());
+    return;
+  }
+  
+  var jsonData = JSON.parse(response.getContentText());
+  if (!jsonData.orders || jsonData.orders.length === 0) {
+    Logger.log("No orders found.");
+    return;
+  }
+  
+  // Step 5: Process orders into a cleaned data array.
+  var skuOrder = ["Movie", "VideoGame", "Sealed", "Dog", "Double",
+                  "Fitness", "Sports", "Music", "Kids", "KidsClamshell",
+                  "DVD", "DisneyClamshell", "Quantity", ""];
+  var cleanedData = [];
+  
+  jsonData.orders.forEach(function(order) {
+    if (order.orderFulfillmentStatus !== "NOT_STARTED") return;
+    if (order.lineItems && order.lineItems.length > 0) {
+      order.lineItems.forEach(function(item) {
+        var title = item.title ? item.title.replace(/["'*]/g, '')
+                                   .replace(/\s*Buy 2 Get 1 Free\s*/gi, '')
+                                   .replace(/\s*Buy 2 Get 1\s*/gi, '')
+                                   .trim() : "";
+        var itemNumber = "";
+        if (item.legacyItemId && item.legacyItemId !== "") {
+          itemNumber = item.legacyItemId;
+        } else if (item.itemId && item.itemId !== "") {
+          itemNumber = item.itemId;
+        }
+        var skuTag = item.sku ? item.sku.trim() : "";
+        if (title && itemNumber) {
+          cleanedData.push({
+            title: title,
+            ebayURL: "https://www.ebay.com/itm/" + itemNumber,
+            skuTag: skuTag,
+            itemNumber: itemNumber
+          });
+        }
+      });
+    }
+  });
+  
+  // Optional: sort the cleaned data by SKU tag then by title (ignoring common prefixes).
+  cleanedData.sort(function(a, b) {
+    function getSkuOrder(tag) {
+      var index = skuOrder.indexOf(tag);
+      return index !== -1 ? index : skuOrder.length;
+    }
+    function stripPrefixes(str) {
+      return str.replace(/^(A |An |The )/i, '');
+    }
+    var skuDiff = getSkuOrder(a.skuTag) - getSkuOrder(b.skuTag);
+    if (skuDiff !== 0) {
+      return skuDiff;
+    }
+    return stripPrefixes(a.title).localeCompare(stripPrefixes(b.title));
+  });
+  
+  // Step 6: Create the document.
+  var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MMMM dd, yyyy");
+  var docName = "Daily List - " + today;
+  var doc = DocumentApp.create(docName);
+  var body = doc.getBody();
+  
+  // Use a fixed ten non-breaking spaces as spacer.
+  var fixedSpacer = "\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0";
+  
+  // Variable to track the current SKU group.
+  var currentSku = "";
+  
+  cleanedData.forEach(function(item) {
+    // When SKU group changes (and not the first group), insert an extra blank paragraph as a line break.
+    if (item.skuTag !== currentSku) {
+      if (currentSku !== "") {
+        body.appendParagraph("");
+      }
+      currentSku = item.skuTag;
+    }
+    
+    var titleStr = item.title;
+    
+    // For items under the "Quantity" tag, don't display the date.
+    if (item.skuTag === "Quantity") {
+      // Insert only the title.
+      var para = body.appendParagraph(titleStr);
+      var textElem = para.editAsText();
+      textElem.setLinkUrl(0, titleStr.length - 1, item.ebayURL);
+      return;  // Skip further processing for this item.
+    }
+    
+    // For items not tagged as "Quantity", get the start time and display the date.
+    var rawStartTime = getItemStartTime(item.itemNumber, accessToken);
+    var formattedDate = "Not Provided";
+    var isRecent = false;
+    if (rawStartTime) {
+      var dateObj = new Date(rawStartTime);
+      // Use the new format MM/dd/yy.
+      formattedDate = Utilities.formatDate(dateObj, Session.getScriptTimeZone(), "MM/dd/yy");
+      // Calculate the age in days.
+      var now = new Date();
+      var diffDays = (now - dateObj) / (1000 * 60 * 60 * 24);
+      if (diffDays <= 2) {
+        isRecent = true;
+      }
+    }
+    
+    // Build the line: title + fixed spacer + formatted date.
+    var line = titleStr + fixedSpacer + formattedDate;
+    
+    // Insert the line as a new paragraph.
+    var para = body.appendParagraph(line);
+    // Set the hyperlink only on the title portion.
+    var textElem = para.editAsText();
+    textElem.setLinkUrl(0, titleStr.length - 1, item.ebayURL);
+    // If the item is recent (date 2 days old or less), set the entire line to bold.
+    if (isRecent) {
+      textElem.setBold(0, textElem.getText().length - 1, true);
+    }
+  });
+  
+  // Step 7: Move the document into the "Ruby Collectibles" folder.
+  folder.addFile(DriveApp.getFileById(doc.getId()));
+  
+  Logger.log("Document created: " + doc.getUrl());
+}
